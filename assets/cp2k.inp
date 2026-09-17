@@ -1,0 +1,391 @@
+#################################################
+#############PARAMETER SECTION###################
+#################################################
+#
+# Everything that changes between systems lives here, so the body below stays
+# untouched. Values in CAPITALS or marked <...> are placeholders you must set.
+#
+# Uncomment exactly ONE run_type. The last uncommented @SET of a name wins, so
+# the commented alternatives are kept as a record of what this input has been
+# used for - switch by moving the '#', don't delete the others.
+#@SET run_type  ENERGY
+@SET run_type GEO_OPT
+#@SET run_type CELL_OPT
+#@SET run_type MD
+#@SET run_type VIBRATIONAL_ANALYSIS
+
+# Seconds. Keep this BELOW your scheduler's time limit so CP2K stops itself
+# cleanly and writes a restart file instead of being killed mid-step.
+@SET walltime 85000
+
+# PROJECT prefixes every output file (<project>-pos-1.xyz, <project>-1.restart...)
+@SET mineral   SYSTEM
+@SET surface   bulk
+@SET project   ${mineral}-${surface}
+@IF ${surface}==bulk
+ @SET project   ${mineral}
+@ENDIF
+
+# Starting geometry. Plain XYZ; the element column must match the &KIND names.
+@SET coord_ini SYSTEM.xyz
+
+# Flip to 'yes' to continue a previous run. This single switch pulls in
+# &EXT_RESTART, changes SCF_GUESS to RESTART, points at the saved wavefunction,
+# and stops &TOPOLOGY re-reading the .xyz (which would rewind the geometry).
+#@SET restart yes
+@SET restart no
+
+# Cell. Lengths in angstrom, angles in degrees. Take these from the structure
+# source, not by eye - a cell that disagrees with the coordinates is a common
+# and silent error.
+@SET PBC YES
+@SET a  <A>
+@SET b  <B>
+@SET c  <C>
+@SET alpha  90.0
+@SET beta   90.0
+@SET gamma  90.0
+@IF ${PBC}==YES
+ # Replicates BOTH the cell and the coordinates. Must match in &CELL and
+ # &TOPOLOGY below, or the two get replicated differently.
+ @SET na              1
+ @SET nb              1
+ @SET nc              1
+@ENDIF
+
+@SET xcf       PBE
+@SET MD_STEPS 30000
+
+# Print frequency: PF for things you want often, PFL for bulky output.
+@SET PF             2
+@SET PFL            20
+
+# Plane-wave cutoffs in Ry. THESE ARE PLACEHOLDERS. The right values are
+# system-specific: converge total energy (and, for CELL_OPT, the cell volume)
+# against CUTOFF before trusting any result. 600/60 is a common starting point
+# for GTH/MOLOPT; hard elements and cell optimization need more.
+@SET cutoff       600
+@SET rel_cutoff   60
+
+# Dispersion correction. DFTD3 needs dftd3.dat in the run directory (ships with
+# CP2K in $CP2K_DATA_DIR). Set to NONE to disable.
+@SET dispersion DFTD3
+@IF ${dispersion}/=NONE
+ @SET disp_r_cutoff 30
+@ENDIF
+
+#################################################
+#######END OF THE PARAMETER SECTION##############
+#################################################
+
+@IF ${restart}==yes
+ &EXT_RESTART
+  RESTART_FILE_NAME ${project}-1.restart
+  # Set to T to also inherit barostat state when resuming an NPT run.
+  RESTART_BAROSTAT F
+ &END EXT_RESTART
+@ENDIF
+
+&GLOBAL
+ PRINT_LEVEL LOW
+ PROJECT ${project}
+ RUN_TYPE ${run_type}
+ WALLTIME ${walltime}
+ # Flush output as it is produced, so a killed job still leaves a readable log.
+ FLUSH_SHOULD_FLUSH  T
+&END GLOBAL
+
+# &MOTION holds the settings for GEO_OPT, CELL_OPT and MD at once. CP2K reads
+# only the block matching RUN_TYPE, so keeping all three is what lets one file
+# serve every run type.
+&MOTION
+ &GEO_OPT
+  # BFGS converges fastest up to a few hundred atoms; LBFGS uses less memory and
+  # suits larger systems; CG is slower but robust when BFGS oscillates.
+  OPTIMIZER BFGS
+  MAX_ITER  1000
+  # All four criteria must be met at once. MAX_FORCE is usually the last to fall.
+  MAX_DR    0.001      # bohr
+  RMS_DR    0.0003
+  MAX_FORCE 0.0001     # hartree/bohr
+  RMS_FORCE 0.00003
+ &END GEO_OPT
+ &CELL_OPT
+  EXTERNAL_PRESSURE [bar] 1.0
+  # Preserve lattice angles - important for hexagonal/monoclinic cells that
+  # would otherwise drift to triclinic.
+  KEEP_ANGLES YES
+  # For a slab with vacuum, add CONSTRAINT Z (or XY/YZ) or the optimizer will
+  # happily crush the vacuum, which costs energy nothing but affects pressure.
+  MAX_DR 0.001
+  MAX_FORCE 0.0001
+  MAX_ITER 1000
+  OPTIMIZER BFGS
+  PRESSURE_TOLERANCE [bar] 100.0
+  RMS_DR 0.0003
+  RMS_FORCE 0.00003
+  TYPE direct_cell_opt
+  &PRINT
+   &CELL
+    &EACH
+     GEO_OPT 1
+     MD 1
+    &END EACH
+   &END CELL
+  &END PRINT
+ &END CELL_OPT
+ &MD
+    ENSEMBLE  NVT
+    STEPS         ${MD_STEPS}
+    # 0.5 fs is right with free hydrogen; 1.0 fs only with constrained X-H bonds.
+    TIMESTEP      0.5
+    TEMPERATURE   300
+    TEMP_KIND
+    TEMP_TOL [K] 0.0
+    # Stops the cell slowly acquiring net momentum ("flying ice cube").
+    COMVEL_TOL 1.0E-7
+    DISPLACEMENT_TOL [angstrom] 0.2
+    &THERMOSTAT
+      # CSVR gives a correct canonical distribution without Nose-Hoover's
+      # ergodicity problems. REGION massive equilibrates fast but damps real
+      # dynamics - switch to GLOBAL for production if transport matters.
+      TYPE CSVR
+      REGION massive
+      &CSVR
+       TIMECON [fs] 100.0
+      &END CSVR
+    &END THERMOSTAT
+    &PRINT
+     FORCE_LAST
+     &ENERGY
+      &EACH
+       MD ${PF}
+      &END EACH
+     &END ENERGY
+     &PROGRAM_RUN_INFO
+      &EACH
+       MD ${PF}
+      &END EACH
+     &END PROGRAM_RUN_INFO
+    &END PRINT
+ &END MD
+ &PRINT
+  &RESTART on
+   ADD_LAST NUMERIC
+   BACKUP_COPIES 1
+   &EACH
+    GEO_OPT ${PFL}
+    MD ${PF}
+   &END EACH
+  &END RESTART
+  # Numbered snapshots, the fallback if the newest restart is truncated.
+  &RESTART_HISTORY on
+   &EACH
+    GEO_OPT 100
+    MD 1000
+   &END EACH
+  &END RESTART_HISTORY
+  &TRAJECTORY on
+   FORMAT xyz
+   &EACH
+    GEO_OPT 1
+    MD ${PF}
+   &END EACH
+  &END TRAJECTORY
+ &END PRINT
+&END MOTION
+
+&FORCE_EVAL
+ METHOD Quickstep
+ # Required for CELL_OPT, and for NPT molecular dynamics.
+ STRESS_TENSOR ANALYTICAL
+ &DFT
+  # Point these at the files shipped with CP2K ($CP2K_DATA_DIR), or copy them
+  # into the run directory. They are not bundled with this skill.
+  BASIS_SET_FILE_NAME BASIS_MOLOPT
+  POTENTIAL_FILE_NAME GTH_POTENTIALS
+
+  # Net charge of the cell. State it whenever the system is not neutral.
+  # CHARGE and MULTIPLICITY must be parity-compatible: alpha = (N + M - 1)/2
+  # has to be a whole number, so a singlet needs an even electron count.
+  CHARGE 0
+
+  # Uncomment LSD (and set MULTIPLICITY) for open-shell systems: transition
+  # metals, radicals, defects. Without it the calculation is spin-restricted.
+  #LSD
+  #MULTIPLICITY 1
+
+@IF ${restart}==yes
+  WFN_RESTART_FILE_NAME ${project}-RESTART.wfn
+@ENDIF
+  &MGRID
+   COMMENSURATE
+   CUTOFF ${cutoff}
+   REL_CUTOFF ${rel_cutoff}
+   NGRIDS 5
+  &END MGRID
+  &QS
+   EPS_DEFAULT 1.0E-12
+   # Reuses the previous step's density as a starting guess - the single
+   # biggest SCF speedup in MD and geometry optimization.
+   EXTRAPOLATION ASPC
+   EXTRAPOLATION_ORDER 3
+   METHOD GPW
+  &END QS
+  @IF ${PBC}==NO
+   &POISSON
+    PERIODIC NONE
+    POISSON_SOLVER MT
+   &END POISSON
+  @ENDIF
+  &SCF
+   EPS_SCF 1.0E-6
+   MAX_SCF 128
+   @IF ${restart}==yes
+    SCF_GUESS RESTART
+   @ENDIF
+   @IF ${restart}==no
+    SCF_GUESS ATOMIC
+   @ENDIF
+   # Orbital Transformation: the efficient choice for insulators and
+   # semiconductors. For genuinely metallic systems use &DIAGONALIZATION with
+   # &SMEAR and &MIXING instead - OT struggles without a gap.
+   &OT on
+    MINIMIZER CG
+    # FULL_SINGLE_INVERSE is cheaper; FULL_ALL is stronger and handles small
+    # or vanishing HOMO-LUMO gaps.
+    PRECONDITIONER FULL_SINGLE_INVERSE
+   &END OT
+   # With OT the inner loop optimizes orbitals at fixed occupation and the
+   # outer loop handles the rest. Keep both EPS_SCF values equal.
+   &OUTER_SCF on
+    EPS_SCF 1.0E-6
+    MAX_SCF 10
+   &END OUTER_SCF
+   &PRINT
+    &RESTART
+     ADD_LAST NUMERIC
+     BACKUP_COPIES 0
+     &EACH
+      QS_SCF 10
+     &END EACH
+    &END RESTART
+   &END PRINT
+  &END SCF
+  &XC
+   &XC_FUNCTIONAL ${xcf}
+   &END XC_FUNCTIONAL
+   @IF ${dispersion}==DFTD3
+   &VDW_POTENTIAL
+    DISPERSION_FUNCTIONAL PAIR_POTENTIAL
+    &PAIR_POTENTIAL
+     R_CUTOFF ${disp_r_cutoff}
+     TYPE DFTD3
+     PARAMETER_FILE_NAME  dftd3.dat
+     # Must match the functional actually in use - driving both from ${xcf}
+     # keeps them consistent automatically.
+     REFERENCE_FUNCTIONAL ${xcf}
+    &END PAIR_POTENTIAL
+   &END VDW_POTENTIAL
+   @ENDIF
+  &END XC
+  &PRINT
+   &DFT_CONTROL_PARAMETERS on
+   &END DFT_CONTROL_PARAMETERS
+  &END PRINT
+ &END DFT
+ &PRINT
+  &TOTAL_NUMBERS ON
+  &END TOTAL_NUMBERS
+ &END PRINT
+ &SUBSYS
+  &CELL
+   ABC ${a} ${b} ${c}
+   ALPHA_BETA_GAMMA ${alpha} ${beta} ${gamma}
+   @IF ${PBC}==NO
+    PERIODIC NONE
+   @ENDIF
+   @IF ${PBC}==YES
+    MULTIPLE_UNIT_CELL ${na} ${nb} ${nc}
+   @ENDIF
+  &END CELL
+
+  # ---------------------------------------------------------------------
+  # One &KIND per element symbol appearing in the coordinate file. A missing
+  # &KIND is the most common hard failure.
+  #
+  # The qN suffix is the number of valence electrons the pseudopotential
+  # exposes and must match what the basis set was built for. A mismatch does
+  # NOT crash - it converges smoothly to a physically meaningless answer.
+  # ---------------------------------------------------------------------
+  &KIND H
+   BASIS_SET DZVP-MOLOPT-SR-GTH
+   POTENTIAL GTH-PBE-q1
+  &END KIND
+  &KIND O
+   BASIS_SET DZVP-MOLOPT-SR-GTH
+   POTENTIAL GTH-PBE-q6
+  &END KIND
+
+  # ---------------------------------------------------------------------
+  # Open-shell / magnetic systems. Requires LSD above.
+  #
+  # &BS sets the STARTING spin state (it is not a constraint - the SCF may
+  # move away from it). The NEL values encode a target spin and ionisation:
+  #
+  #     alpha(NEL) =  2S - dQ        summed over the shells in each channel
+  #     beta(NEL)  = -2S - dQ
+  #
+  # so 2S = (alpha - beta)/2 unpaired electrons and dQ = -(alpha + beta)/2
+  # is the ionic charge. The block below is Fe(2+) high-spin d6: 2S = 4,
+  # dQ = +2. For antiferromagnetic order, define two labelled kinds (Fe1 /
+  # Fe2, each with ELEMENT Fe) and swap the ALPHA and BETA lines in one.
+  #
+  # DFT+U is deliberately NOT included here. U is not transferable between
+  # systems, functionals or oxidation states - add &DFT_PLUS_U only with a
+  # value you can cite:
+  #     &DFT_PLUS_U ON
+  #      L 2                      # 2 = d orbitals
+  #      U_MINUS_J [eV] <VALUE>
+  #     &END DFT_PLUS_U
+  # ---------------------------------------------------------------------
+  #&KIND Fe
+  # ELEMENT Fe
+  # BASIS_SET DZVP-MOLOPT-SR-GTH
+  # POTENTIAL GTH-PBE-q16
+  # &BS on
+  #  &ALPHA
+  #   N    4   3
+  #   L    0   2
+  #   NEL -2   4
+  #  &END ALPHA
+  #  &BETA
+  #   N    4   3
+  #   L    0   2
+  #   NEL -2  -4
+  #  &END BETA
+  # &END BS
+  #&END KIND
+
+  &PRINT
+   &ATOMIC_COORDINATES on
+   &END ATOMIC_COORDINATES
+   &CELL on
+   &END CELL
+   &KINDS on
+    BASIS_SET
+    POTENTIAL
+   &END KINDS
+  &END PRINT
+  &TOPOLOGY
+   @IF ${PBC}==YES
+    # Must match the value in &CELL above.
+    MULTIPLE_UNIT_CELL ${na} ${nb} ${nc}
+   @ENDIF
+   @IF ${restart}==no
+    COORD_FILE_FORMAT XYZ
+    COORD_FILE_NAME ${coord_ini}
+   @ENDIF
+  &END TOPOLOGY
+ &END SUBSYS
+&END FORCE_EVAL
